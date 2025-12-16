@@ -33,15 +33,7 @@ export async function POST(request: NextRequest) {
     }
 
     console.log('Analisando imagem para userId:', userId);
-    console.log('URL da imagem:', image);
 
-    // ============================================================
-    // ALTERNATIVA 1: PROMPT OTIMIZADO COM CHAIN-OF-THOUGHT
-    // ============================================================
-    // Este prompt guia o modelo a raciocinar passo a passo,
-    // resultando em análises mais precisas e detalhadas.
-    // ============================================================
-    
     const systemPrompt = `Você é um analista nutricional especializado. Analise imagens de alimentos seguindo este processo passo a passo:
 
 1. IDENTIFICAÇÃO: Liste todos os alimentos e ingredientes visíveis na imagem.
@@ -95,27 +87,99 @@ Seja preciso nas estimativas e transparente sobre o raciocínio.`;
         },
       ],
       response_format: { type: "json_object" },
-      temperature: 0.7, // Equilíbrio entre criatividade e precisão
+      temperature: 0.7,
     });
 
-    // Extrair e parsear o conteúdo da resposta
-    const analysisResult = JSON.parse(response.choices[0].message.content || '{}');
+    // ===== FIX: MELHOR TRATAMENTO DE RESPOSTA VAZIA =====
+    const content = response.choices[0].message.content;
+    
+    if (!content || content.trim() === '' || content === '{}') {
+      console.error('❌ OpenAI retornou resposta vazia!');
+      console.error('Detalhes da resposta:', JSON.stringify(response, null, 2));
+      
+      return NextResponse.json(
+        { 
+          error: 'A análise não pôde ser concluída',
+          details: 'OpenAI retornou resposta vazia. Possíveis causas: créditos esgotados, rate limit atingido ou problema com a API Key.',
+          debug: {
+            model: response.model,
+            finish_reason: response.choices[0].finish_reason,
+            usage: response.usage
+          }
+        },
+        { status: 500, headers: corsHeaders }
+      );
+    }
 
-    // Log para monitoramento (opcional - pode ser removido em produção)
-    console.log('Análise concluída:', {
+    // Extrair e parsear o conteúdo da resposta
+    const analysisResult = JSON.parse(content);
+
+    // Validar se o resultado tem os campos esperados
+    if (!analysisResult.calorias_totais && !analysisResult.nome_do_prato) {
+      console.error('❌ Resposta da OpenAI não contém campos esperados');
+      
+      return NextResponse.json(
+        { 
+          error: 'Resposta inválida da análise',
+          details: 'A análise não retornou os campos nutricionais esperados.',
+          raw_response: analysisResult
+        },
+        { status: 500, headers: corsHeaders }
+      );
+    }
+
+    // Log para monitoramento
+    console.log('✅ Análise concluída:', {
       userId,
       prato: analysisResult.nome_do_prato,
       calorias: analysisResult.calorias_totais,
-      ingredientes: analysisResult.ingredientes_identificados?.length || 0
+      ingredientes: analysisResult.ingredientes_identificados?.length || 0,
+      tokens_used: response.usage?.total_tokens || 0
     });
 
     // Retornar o resultado da análise com sucesso
     return NextResponse.json(analysisResult, { headers: corsHeaders });
 
   } catch (error) {
-    console.error('Erro na API de análise:', error);
+    console.error('❌ Erro na API de análise:', error);
     
-    // Retornar erro detalhado para debug (em produção, considere mensagens mais genéricas)
+    // Tratamento específico para erros da OpenAI
+    if (error instanceof Error) {
+      // Erro de autenticação
+      if (error.message.includes('401') || error.message.includes('Unauthorized')) {
+        return NextResponse.json(
+          { 
+            error: 'Erro de autenticação com OpenAI',
+            details: 'API Key inválida ou expirada. Verifique as configurações.'
+          },
+          { status: 500, headers: corsHeaders }
+        );
+      }
+
+      // Erro de rate limit
+      if (error.message.includes('429') || error.message.includes('Rate limit')) {
+        return NextResponse.json(
+          { 
+            error: 'Limite de requisições atingido',
+            details: 'Muitas requisições em pouco tempo. Aguarde alguns instantes e tente novamente.'
+          },
+          { status: 429, headers: corsHeaders }
+        );
+      }
+
+      // Erro de quota/créditos
+      if (error.message.includes('quota') || error.message.includes('insufficient_quota')) {
+        return NextResponse.json(
+          { 
+            error: 'Créditos esgotados',
+            details: 'Sem créditos disponíveis na conta OpenAI. Adicione créditos para continuar.'
+          },
+          { status: 500, headers: corsHeaders }
+        );
+      }
+    }
+    
+    // Retornar erro genérico com detalhes
     return NextResponse.json(
       { 
         error: 'Ocorreu um erro ao analisar a imagem.',
